@@ -94,6 +94,18 @@ export type CppData_ArknightsKengxxiaoKoKr = {
             };
         };
     };
+    exSkin: {
+        buildinEvolveMap: {
+            [x: string]: {
+                [x: string]: string;
+            };
+        };
+        buildinPatchMap: {
+            [x: string]: {
+                [x: string]: string;
+            };
+        };
+    };
     exSkills: {
         [x: string]: {
             skillId: string;
