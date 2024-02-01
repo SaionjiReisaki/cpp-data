@@ -195,6 +195,34 @@ export type CppData_ArknightsKengxxiaoZhCn = {
                 formulaType: "F_EXP" | "F_ASC" | "F_GOLD" | "F_DIAMOND";
             };
         };
+        chars: {
+            [x: string]: {
+                charId: string;
+                buffChar: {
+                    buffData: {
+                        buffId: string;
+                        cond: {
+                            phase: "PHASE_0" | "PHASE_1" | "PHASE_2";
+                            level: number;
+                        };
+                    }[];
+                }[];
+            };
+        };
+        buffs: {
+            [x: string]: {
+                buffId: string;
+                buffName: string;
+                buffIcon: string;
+                skillIcon: string;
+                sortId: number;
+                buffColor: string;
+                textColor: string;
+                buffCategory: "FUNCTION" | "OUTPUT" | "RECOVERY";
+                roomType: "CONTROL" | "MEETING" | "HIRE" | "DORMITORY" | "TRAINING" | "WORKSHOP" | "TRADING" | "MANUFACTURE" | "POWER";
+                description: string;
+            };
+        };
     };
     exStage: {
         stages: {
