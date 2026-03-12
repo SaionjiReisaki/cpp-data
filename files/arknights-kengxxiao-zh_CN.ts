@@ -203,7 +203,7 @@ export type CppData_ArknightsKengxxiaoZhCn = {
             [x: string]: {
                 stageId: string;
                 zoneId: string;
-                code: string;
+                code: string | null;
                 name: string | null;
                 difficulty: "NORMAL" | "FOUR_STAR" | "SIX_STAR";
                 diffGroup: "NONE" | "EASY" | "NORMAL" | "TOUGH" | "ALL";
@@ -226,7 +226,7 @@ export type CppData_ArknightsKengxxiaoZhCn = {
             [x: string]: {
                 stageId: string;
                 zoneId: string;
-                code: string;
+                code: string | null;
                 name: string | null;
                 difficulty: "NORMAL" | "FOUR_STAR" | "SIX_STAR";
                 diffGroup: "NONE" | "EASY" | "NORMAL" | "TOUGH" | "ALL";
