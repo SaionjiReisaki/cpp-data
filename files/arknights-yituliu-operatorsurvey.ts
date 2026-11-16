@@ -3,6 +3,7 @@ export type CppData_ArknightsYituliuOperatorsurvey = {
     result: {
         charId: string;
         rarity: number;
+        sampleSize: number;
         own: number;
         elite: {
             rank0: number;
