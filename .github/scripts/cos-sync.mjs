@@ -4,19 +4,39 @@
 // minutes for a few megabytes. No dependencies: the COS XML API needs only signed fetch() calls.
 //
 // Env: COS_SECRET_ID, COS_SECRET_KEY, COS_BUCKET (name-appid), COS_REGION.
-// Optional: COS_CONCURRENCY (default 32), COS_MAX_ATTEMPTS (default 8).
+// Optional: COS_CONCURRENCY (default 32), COS_LARGE_CONCURRENCY (default 2), COS_MAX_ATTEMPTS
+// (default 15).
 
 import { createHash, createHmac } from 'node:crypto'
 import { readdir, readFile } from 'node:fs/promises'
 import { join, relative, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-// The frontend fetches a version first and then the file it names, so a file must be live before
-// the version pointing at it. Deletion runs in reverse for the same reason.
+// The frontend fetches a version first and then the file it names, so a container's files must be
+// live before its version. Deletion runs in reverse for the same reason. `suffix` is what a key adds
+// to its container's name: files/<name>.json and files/<name>.ts go with versions/<name>.version.json.
 const DIRS = [
-  { local: 'files', remote: 'data/files/' },
-  { local: 'versions', remote: 'data/versions/' },
+  { local: 'files', remote: 'data/files/', suffix: /\.[^./]+$/ },
+  { local: 'versions', remote: 'data/versions/', suffix: /\.version\.json$/ },
 ]
+
+// A request is given up only after this long without progress: no body chunk taken by the socket
+// and no response yet. A 60 s limit on the whole request failed all eight attempts at three 4 MB
+// files on the runner's cross-border link to COS. After the last chunk the kernel still holds what
+// it buffered, and the window also has to cover sending that: up to half a minute over an emulated
+// 50 KB/s link.
+const IDLE_TIMEOUT = 120_000
+// authorization() signs for 14 minutes from the attempt's start. Stopping a slow attempt short of
+// that retries it with a fresh signature instead of having COS reject it after the last byte.
+const ATTEMPT_TIMEOUT = 600_000
+const CHUNK = 64 * 1024
+
+// Files this big go through their own, narrower pool, so several of them do not split the runner's
+// bandwidth to COS and crawl along together.
+const LARGE_FILE = 1 << 20
+
+// COS answers a client it finds too slow with 400 and one of these codes rather than with 408.
+const SLOW_CLIENT_CODES = new Set(['RequestTimeout', 'UserNetworkTooSlow'])
 
 // The values mime-types gave cos-action, so objects skipped as unchanged and objects re-uploaded
 // carry the same Content-Type.
@@ -87,26 +107,36 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-async function mapPool(items, concurrency, fn) {
-  const queue = [...items]
-  const errors = []
-  const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
-    while (queue.length > 0) {
-      const item = queue.shift()
-      try {
-        await fn(item)
-      } catch (e) {
-        errors.push(e)
-      }
+// Runs at most `concurrency` of the functions handed to it at once, the rest in arrival order.
+function limiter(concurrency) {
+  let active = 0
+  const waiting = []
+  return async (fn) => {
+    if (active < concurrency) active++
+    else await new Promise((resolve) => waiting.push(resolve))
+    try {
+      return await fn()
+    } finally {
+      const next = waiting.shift()
+      if (next) next()
+      else active--
     }
-  })
-  await Promise.all(workers)
-  if (errors.length > 0) {
-    throw new AggregateError(errors, `${errors.length} of ${items.length} operations failed`)
   }
 }
 
-function makeClient({ secretId, secretKey, origin, maxAttempts }) {
+// Hands the body over a chunk at a time, so each chunk the socket takes counts as progress.
+function bodyStream(body, onProgress) {
+  let offset = 0
+  return new ReadableStream({
+    pull(controller) {
+      onProgress()
+      if (offset >= body.length) controller.close()
+      else controller.enqueue(body.subarray(offset, (offset += CHUNK)))
+    },
+  })
+}
+
+function makeClient({ secretId, secretKey, origin, maxAttempts, idleTimeout, attemptTimeout }) {
   const host = new URL(origin).host
 
   async function attempt({ method, key, query = {}, headers = {}, body }) {
@@ -116,28 +146,43 @@ function makeClient({ secretId, secretKey, origin, maxAttempts }) {
     const url = new URL(pathname.split('/').map(cosEncode).join('/'), origin)
     for (const [k, v] of Object.entries(query)) url.searchParams.set(k, v)
 
-    let res
+    const controller = new AbortController()
+    const abort = (reason) => controller.abort(new DOMException(reason, 'TimeoutError'))
+    const deadline = setTimeout(abort, attemptTimeout, `still running after ${attemptTimeout / 1000}s`)
+    let idle
+    const progress = () => {
+      clearTimeout(idle)
+      idle = setTimeout(abort, idleTimeout, `no progress for ${idleTimeout / 1000}s`)
+    }
+
+    let res, text
     try {
+      progress()
       res = await fetch(url, {
         method,
         headers: {
           ...headers,
+          // A stream body would otherwise go out chunked.
+          ...(body && { 'content-length': String(body.length) }),
           Authorization: authorization({ secretId, secretKey, method, pathname, query, headers: signedHeaders }),
         },
-        body,
-        signal: AbortSignal.timeout(60_000),
+        ...(body && { body: bodyStream(body, progress), duplex: 'half' }),
+        signal: controller.signal,
       })
+      progress()
+      text = await res.text()
     } catch (e) {
       throw new CosError(`${label}: ${e.cause?.code ?? e.name}: ${e.message}`, { retryable: true })
+    } finally {
+      clearTimeout(idle)
+      clearTimeout(deadline)
     }
-    const text = await res.text()
     if (!res.ok) {
-      const detail = [xmlField(text, 'Code'), xmlField(text, 'Message'), xmlField(text, 'RequestId')]
-        .filter(Boolean)
-        .join(' ')
+      const code = xmlField(text, 'Code')
+      const detail = [code, xmlField(text, 'Message'), xmlField(text, 'RequestId')].filter(Boolean).join(' ')
       throw new CosError(`${label}: HTTP ${res.status} ${detail}`, {
         status: res.status,
-        retryable: res.status === 408 || res.status === 429 || res.status >= 500,
+        retryable: res.status === 408 || res.status === 429 || res.status >= 500 || SLOW_CLIENT_CODES.has(code),
       })
     }
     return { res, text }
@@ -196,60 +241,123 @@ function contentType(key) {
   return CONTENT_TYPES[ext] ?? 'application/octet-stream'
 }
 
-export async function sync({ root, secretId, secretKey, bucket, region, origin, concurrency = 32, maxAttempts = 8 }) {
+function containerOf(dir, key) {
+  return key.slice(dir.remote.length).replace(dir.suffix, '')
+}
+
+export async function sync({
+  root,
+  secretId,
+  secretKey,
+  bucket,
+  region,
+  origin,
+  concurrency = 32,
+  largeConcurrency = 2,
+  maxAttempts = 15,
+  idleTimeout = IDLE_TIMEOUT,
+  attemptTimeout = ATTEMPT_TIMEOUT,
+}) {
   origin ??= `https://${bucket}.cos.${region}.myqcloud.com`
-  const request = makeClient({ secretId, secretKey, origin, maxAttempts })
+  const request = makeClient({ secretId, secretKey, origin, maxAttempts, idleTimeout, attemptTimeout })
 
   const locals = await Promise.all(DIRS.map((dir) => listLocal(root, dir)))
   const remotes = await Promise.all(DIRS.map((dir) => listRemote(request, dir.remote)))
   const plans = DIRS.map((dir, i) => ({ dir, local: locals[i], remote: remotes[i] }))
 
-  const stats = { uploaded: 0, unchanged: 0, deleted: 0, bytes: 0 }
+  const stats = { uploaded: 0, unchanged: 0, deleted: 0, held: 0, bytes: 0 }
+  const errors = []
+  // A container with a failed operation keeps the rest of its changes for the next run, so its
+  // version never gets ahead of its files, while every other container still goes out.
+  const failed = new Set()
+  const small = limiter(concurrency)
+  const large = limiter(largeConcurrency)
 
-  for (const { dir, local, remote } of plans) {
-    const changed = []
+  // For each container, its changed objects in each of DIRS.
+  const containers = new Map()
+  for (const [i, { dir, local, remote }] of plans.entries()) {
+    let changed = 0
     for (const [key, path] of local) {
       const body = await readFile(path)
       const md5 = createHash('md5').update(body)
       const hex = md5.copy().digest('hex')
       if (remote.get(key) === hex) {
         stats.unchanged++
-      } else {
-        changed.push({ key, body, hex, base64: md5.digest('base64') })
+        continue
       }
+      const name = containerOf(dir, key)
+      let steps = containers.get(name)
+      if (!steps) {
+        steps = DIRS.map(() => [])
+        containers.set(name, steps)
+      }
+      steps[i].push({ key, body, hex, base64: md5.digest('base64') })
+      changed++
     }
-    console.log(`${dir.local}/: ${changed.length} to upload, ${local.size - changed.length} unchanged`)
-    await mapPool(changed, concurrency, async ({ key, body, hex, base64 }) => {
-      const { res } = await request({
+    console.log(`${dir.local}/: ${changed} to upload, ${local.size - changed} unchanged`)
+  }
+
+  async function put({ key, body, hex, base64 }) {
+    const { res } = await (body.length >= LARGE_FILE ? large : small)(() =>
+      request({
         method: 'PUT',
         key,
         headers: { 'content-type': contentType(key), 'content-md5': base64 },
         body,
-      })
-      const etag = stripQuotes(res.headers.get('etag'))
-      if (etag !== hex) throw new Error(`PUT /${key}: ETag ${etag} does not match MD5 ${hex}`)
-      stats.uploaded++
-      stats.bytes += body.length
-      console.log(`uploaded /${key} (${body.length} bytes)`)
-    })
+      }),
+    )
+    const etag = stripQuotes(res.headers.get('etag'))
+    if (etag !== hex) throw new Error(`PUT /${key}: ETag ${etag} does not match MD5 ${hex}`)
+    stats.uploaded++
+    stats.bytes += body.length
+    console.log(`uploaded /${key} (${body.length} bytes)`)
   }
+
+  // Containers do not wait for each other: a version goes up as soon as its own files are live.
+  await Promise.all(
+    [...containers].map(async ([name, steps]) => {
+      for (const [i, objects] of steps.entries()) {
+        const failures = (await Promise.allSettled(objects.map(put))).filter((r) => r.status === 'rejected')
+        if (failures.length === 0) continue
+        errors.push(...failures.map((r) => r.reason))
+        failed.add(name)
+        for (const { key } of steps.slice(i + 1).flat()) {
+          stats.held++
+          console.warn(`held back /${key}: ${name} has a failed upload`)
+        }
+        return
+      }
+    }),
+  )
 
   for (const { dir, local, remote } of plans.toReversed()) {
     const stale = [...remote.keys()].filter((key) => !local.has(key))
     if (stale.length === 0) continue
     console.log(`${dir.local}/: ${stale.length} to delete`)
-    await mapPool(stale, concurrency, async (key) => {
-      try {
-        await request({ method: 'DELETE', key })
-      } catch (e) {
-        if (e.status !== 404) throw e
-      }
-      stats.deleted++
-      console.log(`deleted /${key}`)
-    })
+    await Promise.all(
+      stale.map(async (key) => {
+        const name = containerOf(dir, key)
+        if (failed.has(name)) {
+          stats.held++
+          console.warn(`held back deleting /${key}: ${name} has a failed operation`)
+          return
+        }
+        try {
+          await small(() => request({ method: 'DELETE', key }))
+        } catch (e) {
+          if (e.status !== 404) {
+            errors.push(e)
+            failed.add(name)
+            return
+          }
+        }
+        stats.deleted++
+        console.log(`deleted /${key}`)
+      }),
+    )
   }
 
-  return stats
+  return { stats, errors }
 }
 
 function env(name) {
@@ -261,22 +369,27 @@ function env(name) {
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   const started = Date.now()
   try {
-    const stats = await sync({
+    const { stats, errors } = await sync({
       root: process.cwd(),
       secretId: env('COS_SECRET_ID'),
       secretKey: env('COS_SECRET_KEY'),
       bucket: env('COS_BUCKET'),
       region: env('COS_REGION'),
       concurrency: Number(process.env.COS_CONCURRENCY || 32),
-      maxAttempts: Number(process.env.COS_MAX_ATTEMPTS || 8),
+      largeConcurrency: Number(process.env.COS_LARGE_CONCURRENCY || 2),
+      maxAttempts: Number(process.env.COS_MAX_ATTEMPTS || 15),
     })
     console.log(
       `done in ${((Date.now() - started) / 1000).toFixed(1)}s: ${stats.uploaded} uploaded (${stats.bytes} bytes), ` +
-        `${stats.unchanged} unchanged, ${stats.deleted} deleted`,
+        `${stats.unchanged} unchanged, ${stats.deleted} deleted, ${stats.held} held back`,
     )
+    for (const err of errors) console.error(err.message ?? err)
+    if (errors.length > 0) {
+      console.error(`${errors.length} operations failed`)
+      process.exit(1)
+    }
   } catch (e) {
-    for (const err of e instanceof AggregateError ? e.errors : [e]) console.error(err.message ?? err)
-    if (e instanceof AggregateError) console.error(e.message)
+    console.error(e.message ?? e)
     process.exit(1)
   }
 }

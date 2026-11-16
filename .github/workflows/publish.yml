@@ -11,7 +11,9 @@ concurrency:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # A 4 MB file can take minutes to reach COS from the runner, and each of up to 14 retries of a
+    # stalled upload first waits out two minutes without progress.
+    timeout-minutes: 60
     steps:
       - name: Checkout 🛎️
         uses: actions/checkout@v4
