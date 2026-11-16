@@ -1,40 +1,31 @@
 name: Build and Deploy
-on: [push]
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # The worker pushes several commits in a row; cancelling would cut an upload off halfway. GitHub
+  # keeps at most one pending run per group, so the newest commit still gets published next.
+  cancel-in-progress: false
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout 🛎️
-        uses: actions/checkout@v2.3.1
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      - name: Install and Build 🔧
-        run: |
-          mkdir dist
-          mv files versions dist/
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
       - name: Upload to COS
-        uses: TencentCloud/cos-action@v1
-        with:
-          secret_id: ${{ secrets.COS_SECRET_ID }}
-          secret_key: ${{ secrets.COS_SECRET_KEY }}
-          cos_bucket: ${{ secrets.COS_BUCKET }}
-          cos_region: ${{ secrets.COS_REGION }}
-          local_path: dist/files
-          remote_path: data/files
-          clean: true
-
-      - name: Upload to COS
-        uses: TencentCloud/cos-action@v1
-        with:
-          secret_id: ${{ secrets.COS_SECRET_ID }}
-          secret_key: ${{ secrets.COS_SECRET_KEY }}
-          cos_bucket: ${{ secrets.COS_BUCKET }}
-          cos_region: ${{ secrets.COS_REGION }}
-          local_path: dist/versions
-          remote_path: data/versions
-          clean: true
+        run: node .github/scripts/cos-sync.mjs
+        env:
+          COS_SECRET_ID: ${{ secrets.COS_SECRET_ID }}
+          COS_SECRET_KEY: ${{ secrets.COS_SECRET_KEY }}
+          COS_BUCKET: ${{ secrets.COS_BUCKET }}
+          COS_REGION: ${{ secrets.COS_REGION }}
