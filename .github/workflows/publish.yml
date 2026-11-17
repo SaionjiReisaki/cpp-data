@@ -11,8 +11,9 @@ concurrency:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    # A 4 MB file can take minutes to reach COS from the runner, and each of up to 14 retries of a
-    # stalled upload first waits out two minutes without progress.
+    # A 1 MiB part can take a minute to reach COS from the runner, and each of up to 14 retries of a
+    # stalled request first waits out two minutes without progress. ORPHAN_AGE in cos-sync.mjs must
+    # stay above this, or a run would abort another run's upload in parts.
     timeout-minutes: 60
     steps:
       - name: Checkout 🛎️

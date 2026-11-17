@@ -4,7 +4,7 @@
 // minutes for a few megabytes. No dependencies: the COS XML API needs only signed fetch() calls.
 //
 // Env: COS_SECRET_ID, COS_SECRET_KEY, COS_BUCKET (name-appid), COS_REGION.
-// Optional: COS_CONCURRENCY (default 32), COS_LARGE_CONCURRENCY (default 2), COS_MAX_ATTEMPTS
+// Optional: COS_CONCURRENCY (default 32), COS_PART_CONCURRENCY (default 4), COS_MAX_ATTEMPTS
 // (default 15).
 
 import { createHash, createHmac } from 'node:crypto'
@@ -31,12 +31,22 @@ const IDLE_TIMEOUT = 120_000
 const ATTEMPT_TIMEOUT = 600_000
 const CHUNK = 64 * 1024
 
-// Files this big go through their own, narrower pool, so several of them do not split the runner's
-// bandwidth to COS and crawl along together.
-const LARGE_FILE = 1 << 20
+// COS refuses a request it finds too slow. On 2026-11-17 it refused 22 PUTs of 4 MB files, each
+// between 205 and 318 seconds in, while no request that finished within 184 seconds was refused; the
+// runner's link gave each upload 20-32 KiB/s. A file larger than this goes up in parts this big: a
+// request a slow link finishes in under a minute, retried alone when it fails. COS takes no smaller
+// part except the last.
+const PART_SIZE = 1 << 20
 
 // COS answers a client it finds too slow with 400 and one of these codes rather than with 408.
 const SLOW_CLIENT_CODES = new Set(['RequestTimeout', 'UserNetworkTooSlow'])
+
+// A file uploaded in parts gets an ETag that is not its MD5, so its MD5 also goes into this metadata.
+const MD5_META = 'x-cos-meta-md5'
+const PLAIN_MD5 = /^[0-9a-f]{32}$/
+
+// Longer than the workflow's timeout-minutes, so an upload in parts open this long has no run left.
+const ORPHAN_AGE = 2 * 3600_000
 
 // The values mime-types gave cos-action, so objects skipped as unchanged and objects re-uploaded
 // carry the same Content-Type.
@@ -103,6 +113,19 @@ function stripQuotes(etag) {
   return etag?.replace(/^"|"$/g, '')
 }
 
+function md5(body) {
+  const hash = createHash('md5').update(body)
+  return { hex: hash.copy().digest('hex'), base64: hash.digest('base64') }
+}
+
+// cos-action only ever sent whole PUTs, so the workflow's key may lack what uploading in parts needs.
+function needs(e) {
+  return e.status === 403
+    ? ' (the key needs cos:InitiateMultipartUpload, cos:UploadPart, cos:CompleteMultipartUpload, ' +
+        'cos:AbortMultipartUpload, cos:ListMultipartUploads and cos:HeadObject)'
+    : ''
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -141,10 +164,16 @@ function makeClient({ secretId, secretKey, origin, maxAttempts, idleTimeout, att
 
   async function attempt({ method, key, query = {}, headers = {}, body }) {
     const pathname = '/' + key
-    const label = `${method} ${pathname}${query.prefix ? `?prefix=${query.prefix}` : ''}`
+    const shown = Object.entries(query)
+      .filter(([k]) => k !== 'max-keys' && k !== 'marker')
+      .map(([k, v]) => (v && k !== 'uploadId' ? `${k}=${v}` : k))
+    const label = `${method} ${pathname}${shown.length ? '?' + shown.join('&') : ''}`
     const signedHeaders = { ...headers, host }
     const url = new URL(pathname.split('/').map(cosEncode).join('/'), origin)
-    for (const [k, v] of Object.entries(query)) url.searchParams.set(k, v)
+    // A flag such as ?uploads goes out bare, as the COS SDKs send it; the signature reads it as empty.
+    url.search = Object.entries(query)
+      .map(([k, v]) => cosEncode(k) + (v === '' ? '' : '=' + cosEncode(v)))
+      .join('&')
 
     const controller = new AbortController()
     const abort = (reason) => controller.abort(new DOMException(reason, 'TimeoutError'))
@@ -177,12 +206,15 @@ function makeClient({ secretId, secretKey, origin, maxAttempts, idleTimeout, att
       clearTimeout(idle)
       clearTimeout(deadline)
     }
-    if (!res.ok) {
+    // Completing an upload in parts answers 200 before the parts are merged, so a failed merge comes
+    // back as an error document in that 200.
+    if (!res.ok || /^\s*(<\?xml[^>]*>\s*)?<Error>/.test(text)) {
       const code = xmlField(text, 'Code')
       const detail = [code, xmlField(text, 'Message'), xmlField(text, 'RequestId')].filter(Boolean).join(' ')
-      throw new CosError(`${label}: HTTP ${res.status} ${detail}`, {
+      throw new CosError(`${label}: ${[`HTTP ${res.status}`, detail].filter(Boolean).join(' ')}`, {
         status: res.status,
-        retryable: res.status === 408 || res.status === 429 || res.status >= 500 || SLOW_CLIENT_CODES.has(code),
+        retryable:
+          res.ok || res.status === 408 || res.status === 429 || res.status >= 500 || SLOW_CLIENT_CODES.has(code),
       })
     }
     return { res, text }
@@ -222,6 +254,32 @@ async function listRemote(request, prefix) {
   }
 }
 
+// The MD5 an object uploaded in parts was given in its metadata, or undefined to upload it again.
+async function storedMd5(request, key) {
+  try {
+    const { res } = await request({ method: 'HEAD', key })
+    return res.headers.get(MD5_META) ?? undefined
+  } catch (e) {
+    console.log(`::warning::uploading /${key} again, as its MD5 could not be read${needs(e)}: ${e.message}`)
+    return undefined
+  }
+}
+
+// A run killed halfway through an upload in parts leaves the parts behind, billed as storage until the
+// upload is aborted. More than one listing's worth waits for the next run.
+async function abortOrphans(request, prefix) {
+  const cutoff = Date.now() - ORPHAN_AGE
+  const { text } = await request({ method: 'GET', key: '', query: { uploads: '', prefix } })
+  for (const [, entry] of text.matchAll(/<Upload>([\s\S]*?)<\/Upload>/g)) {
+    const key = xmlField(entry, 'Key')
+    const initiated = xmlField(entry, 'Initiated')
+    // Written so that a time that does not parse keeps the upload.
+    if (!(Date.parse(initiated) < cutoff)) continue
+    await request({ method: 'DELETE', key, query: { uploadId: xmlField(entry, 'UploadId') } })
+    console.log(`aborted an upload of /${key} left open since ${initiated}`)
+  }
+}
+
 async function listLocal(root, dir) {
   const base = join(root, dir.local)
   const entries = await readdir(base, { recursive: true, withFileTypes: true })
@@ -253,7 +311,7 @@ export async function sync({
   region,
   origin,
   concurrency = 32,
-  largeConcurrency = 2,
+  partConcurrency = 4,
   maxAttempts = 15,
   idleTimeout = IDLE_TIMEOUT,
   attemptTimeout = ATTEMPT_TIMEOUT,
@@ -263,7 +321,21 @@ export async function sync({
 
   const locals = await Promise.all(DIRS.map((dir) => listLocal(root, dir)))
   const remotes = await Promise.all(DIRS.map((dir) => listRemote(request, dir.remote)))
+  await Promise.all(
+    DIRS.map((dir) =>
+      abortOrphans(request, dir.remote).catch((e) =>
+        console.log(`::warning::unfinished uploads in parts were left alone${needs(e)}: ${e.message}`),
+      ),
+    ),
+  )
   const plans = DIRS.map((dir, i) => ({ dir, local: locals[i], remote: remotes[i] }))
+  await Promise.all(
+    plans.flatMap(({ local, remote }) =>
+      [...remote]
+        .filter(([key, etag]) => local.has(key) && !PLAIN_MD5.test(etag))
+        .map(async ([key]) => remote.set(key, await storedMd5(request, key))),
+    ),
+  )
 
   const stats = { uploaded: 0, unchanged: 0, deleted: 0, held: 0, bytes: 0 }
   const errors = []
@@ -271,7 +343,11 @@ export async function sync({
   // version never gets ahead of its files, while every other container still goes out.
   const failed = new Set()
   const small = limiter(concurrency)
-  const large = limiter(largeConcurrency)
+  // Parts, and large files when they go up whole. On the runner's slow link to COS each of three
+  // uploads running side by side still got 20-27 KiB/s, so parts sent together add up.
+  const parts = limiter(partConcurrency)
+  // Cleared once COS refuses to start an upload in parts, so the rest of the large files go up whole.
+  let inParts = true
 
   // For each container, its changed objects in each of DIRS.
   const containers = new Map()
@@ -279,8 +355,7 @@ export async function sync({
     let changed = 0
     for (const [key, path] of local) {
       const body = await readFile(path)
-      const md5 = createHash('md5').update(body)
-      const hex = md5.copy().digest('hex')
+      const { hex, base64 } = md5(body)
       if (remote.get(key) === hex) {
         stats.unchanged++
         continue
@@ -291,14 +366,25 @@ export async function sync({
         steps = DIRS.map(() => [])
         containers.set(name, steps)
       }
-      steps[i].push({ key, body, hex, base64: md5.digest('base64') })
+      steps[i].push({ key, body, hex, base64 })
       changed++
     }
     console.log(`${dir.local}/: ${changed} to upload, ${local.size - changed} unchanged`)
   }
 
-  async function put({ key, body, hex, base64 }) {
-    const { res } = await (body.length >= LARGE_FILE ? large : small)(() =>
+  async function put(object) {
+    const { key, body } = object
+    const uploadId = body.length > PART_SIZE && inParts && (await initiate(object))
+    if (uploadId) await putParts(object, uploadId)
+    else await putWhole(object)
+    stats.uploaded++
+    stats.bytes += body.length
+    const count = Math.ceil(body.length / PART_SIZE)
+    console.log(`uploaded /${key} (${body.length} bytes${uploadId ? ` in ${count} parts` : ''})`)
+  }
+
+  async function putWhole({ key, body, hex, base64 }) {
+    const { res } = await (body.length > PART_SIZE ? parts : small)(() =>
       request({
         method: 'PUT',
         key,
@@ -308,9 +394,66 @@ export async function sync({
     )
     const etag = stripQuotes(res.headers.get('etag'))
     if (etag !== hex) throw new Error(`PUT /${key}: ETag ${etag} does not match MD5 ${hex}`)
-    stats.uploaded++
-    stats.bytes += body.length
-    console.log(`uploaded /${key} (${body.length} bytes)`)
+  }
+
+  async function initiate({ key, hex }) {
+    try {
+      const { text } = await request({
+        method: 'POST',
+        key,
+        query: { uploads: '' },
+        headers: { 'content-type': contentType(key), [MD5_META]: hex },
+      })
+      const uploadId = xmlField(text, 'UploadId')
+      if (!uploadId) throw new Error(`POST /${key}?uploads: no UploadId in the response`)
+      return uploadId
+    } catch (e) {
+      if (e.status !== 403) throw e
+      if (inParts)
+        console.log(`::warning::uploading large files whole, as COS refused one in parts${needs(e)}: ${e.message}`)
+      inParts = false
+    }
+  }
+
+  async function putPart(key, uploadId, partNumber, body) {
+    const { hex, base64 } = md5(body)
+    const { res } = await parts(() =>
+      request({
+        method: 'PUT',
+        key,
+        query: { partNumber: String(partNumber), uploadId },
+        headers: { 'content-md5': base64 },
+        body,
+      }),
+    )
+    const etag = stripQuotes(res.headers.get('etag'))
+    if (etag !== hex) throw new Error(`PUT /${key}?partNumber=${partNumber}: ETag ${etag} does not match MD5 ${hex}`)
+    return etag
+  }
+
+  async function putParts({ key, body }, uploadId) {
+    const results = await Promise.allSettled(
+      Array.from({ length: Math.ceil(body.length / PART_SIZE) }, (_, i) =>
+        putPart(key, uploadId, i + 1, body.subarray(i * PART_SIZE, (i + 1) * PART_SIZE)),
+      ),
+    )
+    try {
+      const failure = results.find((r) => r.status === 'rejected')
+      if (failure) throw failure.reason
+      const list = results.map((r, i) => `<Part><PartNumber>${i + 1}</PartNumber><ETag>"${r.value}"</ETag></Part>`)
+      const xml = Buffer.from(`<CompleteMultipartUpload>${list.join('')}</CompleteMultipartUpload>`)
+      await request({
+        method: 'POST',
+        key,
+        query: { uploadId },
+        headers: { 'content-type': 'application/xml', 'content-md5': md5(xml).base64 },
+        body: xml,
+      })
+    } catch (e) {
+      // The parts already uploaded are billed as storage until the upload is aborted.
+      await request({ method: 'DELETE', key, query: { uploadId } }).catch((err) => console.warn(err.message))
+      throw e
+    }
   }
 
   // Containers do not wait for each other: a version goes up as soon as its own files are live.
@@ -376,7 +519,7 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
       bucket: env('COS_BUCKET'),
       region: env('COS_REGION'),
       concurrency: Number(process.env.COS_CONCURRENCY || 32),
-      largeConcurrency: Number(process.env.COS_LARGE_CONCURRENCY || 2),
+      partConcurrency: Number(process.env.COS_PART_CONCURRENCY || 4),
       maxAttempts: Number(process.env.COS_MAX_ATTEMPTS || 15),
     })
     console.log(
